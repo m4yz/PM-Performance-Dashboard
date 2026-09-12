@@ -1,4 +1,3 @@
-
 import pandas as pd
 import openpyxl
 from io import BytesIO
@@ -11,13 +10,14 @@ def _norm(value):
 
 
 def _find_header_row(ws, required_terms):
-    """Find a row containing all required header terms."""
     required = [_norm(x) for x in required_terms]
+
     for row in ws.iter_rows():
         values = [_norm(cell.value) for cell in row]
         joined = " | ".join(values)
         if all(term in joined for term in required):
             return row[0].row
+
     return None
 
 
@@ -32,7 +32,9 @@ def _classify(pm_name, asset):
         return "HVAC"
     if any(k in text for k in [" AC", "AC-", "AC "]):
         return "HVAC"
-    if any(k in text for k in ["CHILLER", "FREEZER", "COOLER", "ICE MACHINE", "REFRIGERATION"]):
+    if any(k in text for k in [
+        "CHILLER", "FREEZER", "COOLER", "ICE MACHINE", "REFRIGERATION"
+    ]):
         return "Refrigeration"
     if any(k in text for k in ["MDB", "DB-", "ELECTRIC", "ELECTRICAL", "UPS"]):
         return "Electrical"
@@ -59,6 +61,7 @@ def _extract_summary(wb):
 
     headers = [cell.value for cell in ws[header_row]]
     rows = []
+
     for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
         if all(v is None for v in row):
             continue
@@ -66,10 +69,10 @@ def _extract_summary(wb):
 
     df = pd.DataFrame(rows, columns=headers)
 
-    # Standardize expected names where possible
     rename_map = {}
     for col in df.columns:
         n = _norm(col)
+
         if n == "pm name":
             rename_map[col] = "PM Name"
         elif n == "done":
@@ -86,6 +89,7 @@ def _extract_summary(wb):
             rename_map[col] = "Fail %"
 
     df = df.rename(columns=rename_map)
+
     if "PM Name" in df.columns:
         df = df[df["PM Name"].notna()].copy()
 
@@ -96,8 +100,23 @@ def _extract_summary(wb):
     return df
 
 
-def _extract_tasks(wb):
-    records = []
+def _nonempty_join(values):
+    clean = []
+
+    for value in values:
+        if value is None:
+            continue
+
+        text = str(value).strip()
+        if text:
+            clean.append(text)
+
+    return " | ".join(clean) if clean else None
+
+
+def _extract_tasks_and_checklists(wb):
+    task_records = []
+    checklist_records = []
 
     for sheet_name in wb.sheetnames:
         if sheet_name == "Summary":
@@ -113,8 +132,8 @@ def _extract_tasks(wb):
         normalized = [_norm(h) for h in raw_headers]
 
         def idx(term):
-            for i, h in enumerate(normalized):
-                if term == h or term in h:
+            for i, header in enumerate(normalized):
+                if term == header or term in header:
                     return i
             return None
 
@@ -125,55 +144,149 @@ def _extract_tasks(wb):
         done_by_i = idx("done by")
         done_time_i = idx("done time")
         status_i = idx("status")
+
         result_i = None
-        for i, h in enumerate(normalized):
-            if "pass" in h and "fail" in h:
+        for i, header in enumerate(normalized):
+            if "pass" in header and "fail" in header:
                 result_i = i
                 break
 
-        # Sheet names from the current export often contain "<id>_<PM Name>"
+        # PM name is the part after "<plan id>_"
         pm_name = sheet_name.split("_", 1)[1] if "_" in sheet_name else sheet_name
 
-        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
-            if not row or all(v is None for v in row):
+        def get(row, i):
+            return row[i] if i is not None and i < len(row) else None
+
+        # Checklist item labels are stored one row below the main headers.
+        checklist_start = (result_i + 1) if result_i is not None else 8
+        item_labels = {}
+
+        if header_row + 1 <= ws.max_row:
+            for col_i in range(checklist_start, ws.max_column):
+                item = ws.cell(header_row + 1, col_i + 1).value
+
+                if item is None:
+                    continue
+
+                item_text = str(item).strip()
+                if item_text:
+                    item_labels[col_i] = item_text
+
+        # Only rows whose first task column starts with "#" are actual PM tasks.
+        # This deliberately ignores Checklist's Remark / Chats / Comments rows.
+        row_no = header_row + 2
+
+        while row_no <= ws.max_row:
+            row_values = [cell.value for cell in ws[row_no]]
+
+            task_id = get(row_values, id_i)
+            task_id_text = str(task_id).strip() if task_id is not None else ""
+
+            if not task_id_text.startswith("#"):
+                row_no += 1
                 continue
 
-            task_id = row[id_i] if id_i is not None and id_i < len(row) else None
-            if task_id is None:
-                continue
+            remark_values = [None] * ws.max_column
+            chats = None
+            comments = None
 
-            # Ignore non-task sections
-            if not isinstance(task_id, (int, float, str)):
-                continue
+            # The export normally stores the next three rows as:
+            # Checklist's Remark -> Chats -> Comments.
+            if row_no + 1 <= ws.max_row:
+                label = _norm(ws.cell(row_no + 1, 1).value)
+                if "checklist" in label and "remark" in label:
+                    remark_values = [cell.value for cell in ws[row_no + 1]]
 
-            def get(i):
-                return row[i] if i is not None and i < len(row) else None
+            if row_no + 2 <= ws.max_row:
+                label = _norm(ws.cell(row_no + 2, 1).value)
+                if label == "chats":
+                    chats = _nonempty_join(
+                        cell.value for cell in ws[row_no + 2][1:]
+                    )
 
-            records.append({
-                "Task ID": task_id,
+            if row_no + 3 <= ws.max_row:
+                label = _norm(ws.cell(row_no + 3, 1).value)
+                if label == "comments":
+                    comments = _nonempty_join(
+                        cell.value for cell in ws[row_no + 3][1:]
+                    )
+
+            task = {
+                "Task ID": task_id_text,
                 "PM Name": pm_name,
-                "Create Date": get(create_i),
-                "Asset": get(asset_i),
-                "Location": get(location_i),
-                "Done By": get(done_by_i),
-                "Done Time": get(done_time_i),
-                "Status": get(status_i) or "Unknown",
-                "Pass / Fail": get(result_i),
-            })
+                "Create Date": get(row_values, create_i),
+                "Asset": get(row_values, asset_i),
+                "Location": get(row_values, location_i),
+                "Done By": get(row_values, done_by_i),
+                "Done Time": get(row_values, done_time_i),
+                "Status": get(row_values, status_i) or "Unknown",
+                "Pass / Fail": get(row_values, result_i),
+                "Chats": chats,
+                "Comments": comments,
+            }
 
-    tasks = pd.DataFrame(records)
+            task_records.append(task)
 
-    if tasks.empty:
-        return tasks
+            # Convert the horizontal checklist into long format:
+            # one row = one Task ID + one Checklist Item.
+            for col_i, item_name in item_labels.items():
+                result = row_values[col_i] if col_i < len(row_values) else None
+                remark = (
+                    remark_values[col_i]
+                    if col_i < len(remark_values)
+                    else None
+                )
 
-    tasks["Status"] = tasks["Status"].fillna("Unknown").astype(str).str.strip()
-    tasks["Pass / Fail"] = tasks["Pass / Fail"].replace("", pd.NA)
-    tasks["Equipment Group"] = [
-        _classify(pm, asset)
-        for pm, asset in zip(tasks["PM Name"], tasks["Asset"])
-    ]
+                if result is not None and str(result).strip() == "":
+                    result = None
 
-    return tasks
+                if remark is not None and str(remark).strip() == "":
+                    remark = None
+
+                checklist_records.append({
+                    "Task ID": task_id_text,
+                    "PM Name": pm_name,
+                    "Checklist Item": item_name,
+                    "Result": result,
+                    "Remark": remark,
+                })
+
+            # Skip the associated Remark / Chats / Comments rows when present.
+            row_no += 4
+
+    tasks = pd.DataFrame(task_records)
+    checklists = pd.DataFrame(checklist_records)
+
+    if not tasks.empty:
+        tasks["Status"] = tasks["Status"].fillna("Unknown").astype(str).str.strip()
+        tasks["Pass / Fail"] = tasks["Pass / Fail"].replace("", pd.NA)
+        tasks["Equipment Group"] = [
+            _classify(pm, asset)
+            for pm, asset in zip(tasks["PM Name"], tasks["Asset"])
+        ]
+
+    if not checklists.empty and not tasks.empty:
+        task_meta = tasks[[
+            "Task ID",
+            "Asset",
+            "Location",
+            "Create Date",
+            "Done By",
+            "Done Time",
+            "Status",
+            "Equipment Group",
+        ]].copy()
+
+        checklists = checklists.merge(
+            task_meta,
+            on="Task ID",
+            how="left"
+        )
+
+        checklists["Result"] = checklists["Result"].replace("", pd.NA)
+        checklists["Remark"] = checklists["Remark"].replace("", pd.NA)
+
+    return tasks, checklists
 
 
 def _period_text(tasks):
@@ -182,24 +295,31 @@ def _period_text(tasks):
 
     dates = pd.to_datetime(tasks["Create Date"], errors="coerce")
     dates = dates.dropna()
+
     if dates.empty:
         return None
 
     start = dates.min().strftime("%d %b %Y")
     end = dates.max().strftime("%d %b %Y")
+
     return f"Create Date range: {start} – {end}"
 
 
 def process_pm_report(uploaded_file):
     content = uploaded_file.getvalue()
-    wb = openpyxl.load_workbook(BytesIO(content), read_only=True, data_only=True)
+    wb = openpyxl.load_workbook(
+        BytesIO(content),
+        read_only=True,
+        data_only=True
+    )
 
     summary = _extract_summary(wb)
-    tasks = _extract_tasks(wb)
+    tasks, checklists = _extract_tasks_and_checklists(wb)
 
     return {
         "summary": summary,
         "tasks": tasks,
+        "checklists": checklists,
         "meta": {
             "period_text": _period_text(tasks),
             "sheet_count": len(wb.sheetnames),
